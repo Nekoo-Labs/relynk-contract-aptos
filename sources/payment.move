@@ -1,23 +1,25 @@
 module relynk::paymentv1 {
     use std::string::{Self, String};
     use std::signer;
-    use std::vector;
     use aptos_framework::coin;
     use aptos_framework::event;
     use aptos_framework::type_info;
     use aptos_framework::timestamp;
     use aptos_framework::account;
-    use aptos_framework::resource_account;
+    use aptos_std::table::{Self, Table};
     use relynk::supported_tokens;
 
     // Error codes
     const E_TOKEN_NOT_SUPPORTED: u64 = 1;
-    const E_INVALID_AMOUNT: u64 = 2; // Amount must be greater than zero
-    const E_INSUFFICIENT_BALANCE: u64 = 3; // Not enough balance
-    const E_LINK_NOT_FOUND: u64 = 4; // Transfer link does not exist
-    const E_LINK_ALREADY_CLAIMED: u64 = 5; // Transfer link already claimed
-    const E_LINK_EXPIRED: u64 = 6; // Transfer link expired
+    const E_INVALID_AMOUNT: u64 = 2;
+    const E_INSUFFICIENT_BALANCE: u64 = 3;
+    const E_LINK_NOT_FOUND: u64 = 4;
+    const E_LINK_ALREADY_CLAIMED: u64 = 5;
+    const E_LINK_EXPIRED: u64 = 6;
+    const E_NOT_AUTHORIZED: u64 = 7;
+    const E_LINK_ALREADY_EXISTS: u64 = 8;
 
+    // Events
     #[event]
     struct PaymentProcessed has drop, store {
         payment_id: String,
@@ -25,17 +27,16 @@ module relynk::paymentv1 {
         recipient: address,
         amount: u64,
         token: String,
-        metadata: String,
         timestamp: u64,
     }
 
     #[event]
-    struct CreateTransferLink has drop, store {
+    struct TransferLinkCreated has drop, store {
         link_id: String,
         sender: address,
         amount: u64,
         token: String,
-        metadata: String,
+        expires_at: u64,
         timestamp: u64,
     }
 
@@ -49,128 +50,171 @@ module relynk::paymentv1 {
         timestamp: u64,
     }
 
+    // Escrow capability for resource account
     struct EscrowCapability has key {
-        signer_cap: account::SignerCapability,
+        cap: account::SignerCapability
+    }
+
+    // Store for transfer links
+    struct TransferLinkStore<phantom T> has key {
+        links: Table<String, TransferLink<T>>,
     }
 
     // Transfer link structure
-    struct TransferLink<phantom TokenType> has key {
+    struct TransferLink<phantom T> has store {
         sender: address,
         amount: u64,
-        metadata: String,
         created_at: u64,
         expires_at: u64,
         is_claimed: bool,
-        escrow_addr: address,
     }
 
-    // Global Storage for all transfer links
-    struct TransferLinkRegistry has key {
-        links: vector<String>, // Store all link IDs
+    // Initialize escrow account
+    public entry fun init(admin: &signer) {
+        let who = signer::address_of(admin);
+        assert!(who == @relynk, E_NOT_AUTHORIZED);
+        
+        if (!exists<EscrowCapability>(@relynk)) {
+            let (escrow_signer, cap) = account::create_resource_account(admin, b"relynk_escrow_v1");
+            // Register for APT and USDC
+            coin::register<aptos_framework::aptos_coin::AptosCoin>(&escrow_signer);
+            move_to(admin, EscrowCapability { cap });
+        }
     }
 
-    // struct UserTransferLinks has key {
-    //     active_links: vector<String>,
-    // }
-
-    fun init_module(deployer: &signer) {
-        let (resource_signer, signer_cap) = account::create_resource_account(deployer, b"relynk_escrow_v1");
-        let escrow_addr = signer::address_of(&resource_signer);
-
-        move_to(deployer, TransferLinkRegistry {
-            links: vector::empty<String>(),
-        });
-
-        coin::register<aptos_framework::aptos_coin::AptosCoin>(&resource_signer);
+    // Ensure store exists for a token type
+    public entry fun ensure_store<T: store>(admin: &signer) {
+        let who = signer::address_of(admin);
+        assert!(who == @relynk, E_NOT_AUTHORIZED);
+        
+        if (!exists<TransferLinkStore<T>>(@relynk)) {
+            move_to(admin, TransferLinkStore<T> { 
+                links: table::new<String, TransferLink<T>>() 
+            });
+        }
     }
 
-    // Payment Processing
-    public entry fun payment_process<TokenType>(payer: &signer, recipient: address, amount: u64, payment_id: String, metadata: String) {
+    // 1. Process payment (untuk payment request yang linknya dibuat off-chain)
+    // Process payment from payer to recipient directly
+    public entry fun process_payment<T: store>(
+        payer: &signer, 
+        recipient: address, 
+        amount: u64, 
+        payment_id: String
+    ) {
         let payer_addr = signer::address_of(payer);
 
         // Validate inputs
         assert!(amount > 0, E_INVALID_AMOUNT);
+        supported_tokens::assert_supported<T>(@relynk);
 
-        supported_tokens::assert_supported<TokenType>(@relynk);
-
-        let balance = coin::balance<TokenType>(payer_addr);
+        // Check payer balance
+        let balance = coin::balance<T>(payer_addr);
         assert!(balance >= amount, E_INSUFFICIENT_BALANCE);
 
-        coin::transfer<TokenType>(payer, recipient, amount);
+        // Ensure both accounts are registered for the token
+        if (!coin::is_account_registered<T>(payer_addr)) {
+            coin::register<T>(payer);
+        };
 
-        let token_name = get_token_name<TokenType>();
+        // Direct transfer from payer to recipient
+        coin::transfer<T>(payer, recipient, amount);
 
+        // Emit event
         event::emit(PaymentProcessed {
             payment_id,
             payer: payer_addr,
             recipient,
             amount,
-            token: token_name,
-            metadata,
+            token: type_info::type_name<T>(),
             timestamp: timestamp::now_seconds(),
         });
     }
 
-    public entry fun create_transfer_link<TokenType>(sender: &signer, amount: u64, link_id: String, metadata: String, expires_in_hours: u64) acquires EscrowCapability {
-        let sender_addr = signer::address_of(sender);
-
-        // Validate inputs
+    // 2. Create transfer with link (sender creates link, money held in escrow)
+    public entry fun create_transfer_with_link<T: store>(
+        sender: &signer, 
+        link_id: String,
+        amount: u64, 
+        expires_in_hours: u64
+    ) acquires EscrowCapability, TransferLinkStore {
         assert!(amount > 0, E_INVALID_AMOUNT);
-        // Check token support
-        supported_tokens::assert_supported<TokenType>(@relynk);
-
-        let balance = coin::balance<TokenType>(sender_addr);
+        supported_tokens::assert_supported<T>(@relynk);
+        
+        let sender_addr = signer::address_of(sender);
+        
+        // Check if sender has enough balance
+        let balance = coin::balance<T>(sender_addr);
         assert!(balance >= amount, E_INSUFFICIENT_BALANCE);
-
+        
+        // Ensure sender is registered for the token
+        if (!coin::is_account_registered<T>(sender_addr)) {
+            coin::register<T>(sender);
+        };
+        
         // Get escrow signer
-        let escrow_cap = borrow_global<EscrowCapability>(@relynk);
-        let escrow_signer = account::create_signer_with_capability(&escrow_cap.signer_cap);
+        let cap = borrow_global<EscrowCapability>(@relynk);
+        let escrow_signer = account::create_signer_with_capability(&cap.cap);
         let escrow_addr = signer::address_of(&escrow_signer);
-
-        // Transfer tokens to escrow (relynk)
-        coin::transfer<TokenType>(sender, escrow_addr, amount);
-
-        // Store transfer link data
-        let expires_at = timestamp::now_seconds() + (expires_in_hours * 3600);
-        move_to(sender, TransferLink<TokenType> {
+        
+        // Ensure escrow is registered for this token
+        if (!coin::is_account_registered<T>(escrow_addr)) {
+            coin::register<T>(&escrow_signer);
+        };
+        
+        // Get the store
+        let store = borrow_global_mut<TransferLinkStore<T>>(@relynk);
+        assert!(!store.links.contains(link_id), E_LINK_ALREADY_EXISTS);
+        
+        // Transfer amount to escrow
+        coin::transfer<T>(sender, escrow_addr, amount);
+        
+        let expires_at = timestamp::now_seconds() + expires_in_hours * 3600;
+        
+        // Create transfer link
+        store.links.add(link_id, TransferLink<T> {
             sender: sender_addr,
             amount,
-            metadata,
             created_at: timestamp::now_seconds(),
             expires_at,
             is_claimed: false,
-            escrow_addr,
         });
 
-        event::emit(CreateTransferLink {
+        event::emit(TransferLinkCreated {
             link_id,
             sender: sender_addr,
             amount,
-            token: get_token_name<TokenType>(),
-            metadata,
+            token: type_info::type_name<T>(),
+            expires_at,
             timestamp: timestamp::now_seconds(),
         });
     }
 
-    // Claim Transfer Link
-    public entry fun claim_transfer_link<TokenType>(claimer: &signer, sender_addr: address, link_id: String) acquires EscrowCapability, TransferLink {
+    // 3. Claim transfer (recipient claims money from link)
+    public entry fun claim_transfer<T: store>(
+        claimer: &signer, 
+        link_id: String
+    ) acquires EscrowCapability, TransferLinkStore {
         let claimer_addr = signer::address_of(claimer);
-
-        // Get the transfer link
-        assert!(exists<TransferLink<TokenType>>(sender_addr), E_LINK_NOT_FOUND);
-        let transfer_link = borrow_global_mut<TransferLink<TokenType>>(sender_addr);
-
-        // Validate claim
+        
+        // Ensure claimer is registered for the token
+        if (!coin::is_account_registered<T>(claimer_addr)) {
+            coin::register<T>(claimer);
+        };
+        
+        let store = borrow_global_mut<TransferLinkStore<T>>(@relynk);
+        assert!(store.links.contains(link_id), E_LINK_NOT_FOUND);
+        
+        let transfer_link = store.links.borrow_mut(link_id);
         assert!(!transfer_link.is_claimed, E_LINK_ALREADY_CLAIMED);
         assert!(timestamp::now_seconds() <= transfer_link.expires_at, E_LINK_EXPIRED);
 
-        // Get escrow signer and transfer
-        let escrow_cap = borrow_global<EscrowCapability>(@relynk);
-        let escrow_signer = account::create_signer_with_capability(&escrow_cap.signer_cap);
-
-        // Transfer the tokens from escrow (relynk) to the claimer
-        coin::transfer<TokenType>(&escrow_signer, claimer_addr, transfer_link.amount);
-
+        // Get escrow signer and transfer tokens from escrow to claimer
+        let cap = borrow_global<EscrowCapability>(@relynk);
+        let escrow_signer = account::create_signer_with_capability(&cap.cap);
+        
+        coin::transfer<T>(&escrow_signer, claimer_addr, transfer_link.amount);
+        
         // Mark as claimed
         transfer_link.is_claimed = true;
 
@@ -179,92 +223,29 @@ module relynk::paymentv1 {
             sender: transfer_link.sender,
             claimer: claimer_addr,
             amount: transfer_link.amount,
-            token: get_token_name<TokenType>(),
+            token: type_info::type_name<T>(),
             timestamp: timestamp::now_seconds(),
         });
     }
 
-    /// Query function to get transfer link info
+    // View function untuk cek info transfer link
     #[view]
-    public fun get_transfer_link_info<TokenType>(sender:address): (u64, bool, u64) acquires TransferLink {
-        if (exists<TransferLink<TokenType>>(sender)) {
-            let link = borrow_global<TransferLink<TokenType>>(sender);
-            (link.amount, link.is_claimed, link.expires_at)
-        } else {
-            (0, false, 0)
-        }
-    }
-
-    /// Helper function to get token name from TypeInfo
-    fun get_token_name<TokenType>(): String {
-        type_info::type_name<TokenType>()
+    public fun get_transfer_link_info<T>(link_id: String): (address, u64, u64, u64, bool) acquires TransferLinkStore {
+        if (!exists<TransferLinkStore<T>>(@relynk)) {
+            return (@0x0, 0, 0, 0, false)
+        };
+        
+        let store = borrow_global<TransferLinkStore<T>>(@relynk);
+        if (!store.links.contains(link_id)) {
+            return (@0x0, 0, 0, 0, false)
+        };
+        
+        let link = store.links.borrow(link_id);
+        (link.sender, link.amount, link.created_at, link.expires_at, link.is_claimed)
     }
 
     #[view]
-    /// Query function to check if a token is supported
-    public fun is_token_supported<TokenType>(): bool {
-        supported_tokens::is_supported<TokenType>(@relynk)
+    public fun is_token_supported<T>(): bool {
+        supported_tokens::is_supported<T>(@relynk)
     }
-
-    // /// Batch payment function (multiple recipients)
-    // public entry fun batch_payment<TokenType>(
-    //     payer: &signer,
-    //     recipients: vector<address>,
-    //     amounts: vector<u64>,
-    //     _payment_id: String,
-    //     metadata: String
-    // ) {
-    //     let payer_addr = signer::address_of(payer);
-
-    //     // Validate token support
-    //     supported_tokens::assert_supported<TokenType>(@relynk);
-
-    //     // Validate input lengths match
-    //     assert!(recipients.length() == amounts.length(), E_INVALID_AMOUNT);
-
-    //     let recipients_len = recipients.length();
-    //     let total_amount = calculate_total_amount(&amounts);
-
-    //     // Check total balance
-    //     let balance = coin::balance<TokenType>(payer_addr);
-    //     assert!(balance >= total_amount, E_INSUFFICIENT_BALANCE);
-
-    //     // Process payments
-    //     let i = 0;
-    //     while (i < recipients_len) {
-    //         let recipient = recipients[i];
-    //         let amount = amounts[i];
-
-    //         coin::transfer<TokenType>(payer, recipient, amount);
-
-    //         // Emit individual payment event
-    //         event::emit(PaymentProcessed {
-    //             payment_id: string::utf8(b"batch_"),
-    //             payer: payer_addr,
-    //             recipient,
-    //             amount,
-    //             token: get_token_name<TokenType>(),
-    //             metadata,
-    //             timestamp: timestamp::now_seconds(),
-    //         });
-
-    //         i += 1;
-    //     };
-    // }
-
-    // /// Helper function to calculate total amount from vector
-    // fun calculate_total_amount(amounts: &vector<u64>): u64 {
-    //     let len = amounts.length();
-    //     let total = 0;
-    //     let i = 0;
-
-    //     while (i < len) {
-    //         let amount = amounts[i];
-    //         assert!(amount > 0, E_INVALID_AMOUNT);
-    //         total += amount;
-    //         i += 1;
-    //     };
-
-    //     total
-    // }
 }
