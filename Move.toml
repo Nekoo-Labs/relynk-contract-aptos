@@ -4,13 +4,13 @@ version = "1.0.0"
 authors = []
 
 [addresses]
-relynk = "0x1"
+relynk = "0xe012406f23b3c3101a8c3d506e8b6df0e6d69598a526e78827be2d42e5d10dc9"
 
 [dev-addresses]
 
 [dependencies.AptosFramework]
 git = "https://github.com/aptos-labs/aptos-framework.git"
-rev = "mainnet"
+rev = "testnet"
 subdir = "aptos-framework"
 
 [dev-dependencies]

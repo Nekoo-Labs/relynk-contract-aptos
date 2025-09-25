@@ -6,9 +6,8 @@ module relynk::supported_tokens {
 
     /// Errors
     const E_NOT_AUTHORIZED: u64 = 1;
-    const E_ALREADY_INIT: u64 = 2;
-    const E_NOT_SUPPORTED: u64 = 3;
-    const E_NOT_INITIALIZED: u64 = 4;
+    const E_NOT_SUPPORTED: u64 = 2;
+    const E_NOT_INITIALIZED: u64 = 3;
 
     /// Resource for storing token allowlist
     struct SupportedTokens has key {
@@ -16,10 +15,10 @@ module relynk::supported_tokens {
     }
 
     /// Initialize once (published at @relynk)
-    public entry fun init_supported_tokens(admin: &signer) {
+    fun init_module(admin: &signer) {
         let admin_addr = signer::address_of(admin);
         assert!(admin_addr == @relynk, E_NOT_AUTHORIZED);
-        assert!(!exists<SupportedTokens>(admin_addr), E_ALREADY_INIT);
+        
         move_to(admin, SupportedTokens { 
             allowed: table::new<TypeInfo, bool>() 
         });
@@ -38,10 +37,10 @@ module relynk::supported_tokens {
         let supported_tokens = borrow_global_mut<SupportedTokens>(admin_addr);
         
         // Use upsert pattern - either update existing or add new
-        if (table::contains(&supported_tokens.allowed, type_info)) {
-            *table::borrow_mut(&mut supported_tokens.allowed, type_info) = true;
+        if (supported_tokens.allowed.contains(type_info)) {
+            *supported_tokens.allowed.borrow_mut(type_info) = true;
         } else {
-            table::add(&mut supported_tokens.allowed, type_info, true);
+            supported_tokens.allowed.add(type_info, true);
         }
     }
 
@@ -55,10 +54,10 @@ module relynk::supported_tokens {
         let supported_tokens = borrow_global_mut<SupportedTokens>(admin_addr);
         
         // Set to false whether it exists or not
-        if (table::contains(&supported_tokens.allowed, type_info)) {
-            *table::borrow_mut(&mut supported_tokens.allowed, type_info) = false;
+        if (supported_tokens.allowed.contains(type_info)) {
+            *supported_tokens.allowed.borrow_mut(type_info) = false;
         } else {
-            table::add(&mut supported_tokens.allowed, type_info, false);
+            supported_tokens.allowed.add(type_info, false);
         }
     }
 
@@ -71,8 +70,8 @@ module relynk::supported_tokens {
         let type_info = type_info::type_of<T>();
         let supported_tokens = borrow_global<SupportedTokens>(registry_owner);
         
-        if (table::contains(&supported_tokens.allowed, type_info)) {
-            *table::borrow(&supported_tokens.allowed, type_info)
+        if (supported_tokens.allowed.contains(type_info)) {
+            *supported_tokens.allowed.borrow(type_info)
         } else {
             false
         }
@@ -82,24 +81,4 @@ module relynk::supported_tokens {
     public fun assert_supported<T>(registry_owner: address) acquires SupportedTokens {
         assert!(is_supported<T>(registry_owner), E_NOT_SUPPORTED);
     }
-
-    // Additional helper functions for better usability
-
-    /// Check if the supported tokens registry exists
-    public fun registry_exists(registry_owner: address): bool {
-        exists<SupportedTokens>(registry_owner)
-    }
-
-    #[view]
-    /// Check if a specific token type is in the registry (regardless of true/false value)
-    public fun token_exists_in_registry<T>(registry_owner: address): bool acquires SupportedTokens {
-        if (!exists<SupportedTokens>(registry_owner)) {
-            return false
-        };
-        let type_info = type_info::type_of<T>();
-        let supported_tokens = borrow_global<SupportedTokens>(registry_owner);
-        table::contains(&supported_tokens.allowed, type_info)
-    }
-
-    
 }

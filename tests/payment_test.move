@@ -10,7 +10,7 @@ module relynk::payment_tests {
     use relynk::supported_tokens;
 
     // Mock USDC for testing
-    struct MockUSDC {}
+    struct MockUSDC has store {}
 
     struct MockUSDCCapabilities has key {
         burn_cap: coin::BurnCapability<MockUSDC>,
@@ -72,7 +72,6 @@ module relynk::payment_tests {
         // Initialize payment system
         paymentv1::init(relynk);
         paymentv1::ensure_store<AptosCoin>(relynk);
-        paymentv1::ensure_store<MockUSDC>(relynk);
 
         // Verify tokens are supported
         assert!(paymentv1::is_token_supported<AptosCoin>(), 1);

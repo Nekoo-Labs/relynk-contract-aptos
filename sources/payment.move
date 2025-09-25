@@ -1,13 +1,16 @@
 module relynk::paymentv1 {
     use std::string::{Self, String};
     use std::signer;
+    use std::vector;
     use aptos_framework::coin;
     use aptos_framework::event;
     use aptos_framework::type_info;
     use aptos_framework::timestamp;
     use aptos_framework::account;
     use aptos_std::table::{Self, Table};
+    use std::hash;
     use relynk::supported_tokens;
+    use relynk::mock_usdc::MockUSDC;
 
     // Error codes
     const E_TOKEN_NOT_SUPPORTED: u64 = 1;
@@ -32,7 +35,7 @@ module relynk::paymentv1 {
 
     #[event]
     struct TransferLinkCreated has drop, store {
-        link_id: String,
+        claim_id: String,
         sender: address,
         amount: u64,
         token: String,
@@ -42,7 +45,7 @@ module relynk::paymentv1 {
 
     #[event]
     struct TransferClaimed has drop, store {
-        link_id: String,
+        claim_id: String,
         sender: address,
         claimer: address,
         amount: u64,
@@ -53,6 +56,10 @@ module relynk::paymentv1 {
     // Escrow capability for resource account
     struct EscrowCapability has key {
         cap: account::SignerCapability
+    }
+
+    struct LinkCounter has key {
+        count: u64,
     }
 
     // Store for transfer links
@@ -69,17 +76,59 @@ module relynk::paymentv1 {
         is_claimed: bool,
     }
 
-    // Initialize escrow account
-    public entry fun init(admin: &signer) {
-        let who = signer::address_of(admin);
-        assert!(who == @relynk, E_NOT_AUTHORIZED);
+    fun generate_claim_id(sender: address, counter: u64): String {
+        let timestamp = timestamp::now_seconds();
+        let data = vector::empty<u8>();
+
+        let timestamp_bytes = vector::empty<u8>();
+        let temp_timestamp = timestamp;
+        while (temp_timestamp > 0) {
+            timestamp_bytes.push_back((temp_timestamp % 256) as u8);
+            temp_timestamp /= 256;
+        };
+        data.append(timestamp_bytes);
+
+        let sender_bytes = std::bcs::to_bytes(&sender);
+        data.append(sender_bytes);
+
+        let counter_bytes = vector::empty<u8>();
+        let temp_counter = counter;
+        while (temp_counter > 0) {
+            timestamp_bytes.push_back((temp_timestamp % 256) as u8);
+            temp_timestamp /= 256;
+        };
+        data.append(counter_bytes);
         
-        if (!exists<EscrowCapability>(@relynk)) {
-            let (escrow_signer, cap) = account::create_resource_account(admin, b"relynk_escrow_v1");
-            // Register for APT and USDC
-            coin::register<aptos_framework::aptos_coin::AptosCoin>(&escrow_signer);
-            move_to(admin, EscrowCapability { cap });
-        }
+        let hash_bytes = hash::sha3_256(data);
+
+        let hex_chars = b"0123456789abcdef";
+        let hex_string = vector::empty<u8>();
+        let i = 0;
+        while (1 < 16 && i < hash_bytes.length()) {
+            let byte = hash_bytes[i];
+            hex_string.push_back(hex_chars[(byte >> 4) as u64]);
+            hex_string.push_back(hex_chars[(byte & 0x0F) as u64]);
+            i += 1;
+        };
+
+        string::utf8(hex_string)
+    }
+
+    // Initialize escrow account
+    fun init_module(admin: &signer) {
+        let (escrow_signer, cap) = account::create_resource_account(admin, b"relynk_escrow_v1");
+        
+        // Register tokens for escrow
+        coin::register<aptos_framework::aptos_coin::AptosCoin>(&escrow_signer);
+        coin::register<MockUSDC>(&escrow_signer);
+
+        // Store escrow capability
+        move_to(admin, EscrowCapability { cap });
+
+        move_to(admin, LinkCounter { count: 0 });
+
+        // auto add mock USDC as supported token
+        supported_tokens::add_supported_token<MockUSDC>(admin);
     }
 
     // Ensure store exists for a token type
@@ -133,11 +182,10 @@ module relynk::paymentv1 {
 
     // 2. Create transfer with link (sender creates link, money held in escrow)
     public entry fun create_transfer_with_link<T: store>(
-        sender: &signer, 
-        link_id: String,
+        sender: &signer,
         amount: u64, 
         expires_in_hours: u64
-    ) acquires EscrowCapability, TransferLinkStore {
+    ) acquires EscrowCapability, TransferLinkStore, LinkCounter {
         assert!(amount > 0, E_INVALID_AMOUNT);
         supported_tokens::assert_supported<T>(@relynk);
         
@@ -151,6 +199,10 @@ module relynk::paymentv1 {
         if (!coin::is_account_registered<T>(sender_addr)) {
             coin::register<T>(sender);
         };
+
+        if (!coin::is_account_registered<T>(sender_addr)) {
+            coin::register<T>(sender);
+        };
         
         // Get escrow signer
         let cap = borrow_global<EscrowCapability>(@relynk);
@@ -161,10 +213,20 @@ module relynk::paymentv1 {
         if (!coin::is_account_registered<T>(escrow_addr)) {
             coin::register<T>(&escrow_signer);
         };
+
+        if (!exists<TransferLinkStore<T>>(@relynk)) {
+            let admin_signer = account::create_signer_with_capability(&cap.cap);
+            move_to(&admin_signer, TransferLinkStore<T> { 
+                links: table::new<String, TransferLink<T>>() 
+            });
+        };
+
+        let counter = borrow_global_mut<LinkCounter>(@relynk);
+        counter.count += 1;
+        let claim_id = generate_claim_id(sender_addr, counter.count);
         
         // Get the store
         let store = borrow_global_mut<TransferLinkStore<T>>(@relynk);
-        assert!(!store.links.contains(link_id), E_LINK_ALREADY_EXISTS);
         
         // Transfer amount to escrow
         coin::transfer<T>(sender, escrow_addr, amount);
@@ -172,7 +234,7 @@ module relynk::paymentv1 {
         let expires_at = timestamp::now_seconds() + expires_in_hours * 3600;
         
         // Create transfer link
-        store.links.add(link_id, TransferLink<T> {
+        store.links.add(claim_id, TransferLink<T> {
             sender: sender_addr,
             amount,
             created_at: timestamp::now_seconds(),
@@ -181,7 +243,7 @@ module relynk::paymentv1 {
         });
 
         event::emit(TransferLinkCreated {
-            link_id,
+            claim_id,
             sender: sender_addr,
             amount,
             token: type_info::type_name<T>(),
@@ -193,7 +255,7 @@ module relynk::paymentv1 {
     // 3. Claim transfer (recipient claims money from link)
     public entry fun claim_transfer<T: store>(
         claimer: &signer, 
-        link_id: String
+        claim_id: String
     ) acquires EscrowCapability, TransferLinkStore {
         let claimer_addr = signer::address_of(claimer);
         
@@ -203,9 +265,9 @@ module relynk::paymentv1 {
         };
         
         let store = borrow_global_mut<TransferLinkStore<T>>(@relynk);
-        assert!(store.links.contains(link_id), E_LINK_NOT_FOUND);
-        
-        let transfer_link = store.links.borrow_mut(link_id);
+        assert!(store.links.contains(claim_id), E_LINK_NOT_FOUND);
+
+        let transfer_link = store.links.borrow_mut(claim_id);
         assert!(!transfer_link.is_claimed, E_LINK_ALREADY_CLAIMED);
         assert!(timestamp::now_seconds() <= transfer_link.expires_at, E_LINK_EXPIRED);
 
@@ -219,7 +281,7 @@ module relynk::paymentv1 {
         transfer_link.is_claimed = true;
 
         event::emit(TransferClaimed {
-            link_id,
+            claim_id,
             sender: transfer_link.sender,
             claimer: claimer_addr,
             amount: transfer_link.amount,
@@ -230,18 +292,25 @@ module relynk::paymentv1 {
 
     // View function untuk cek info transfer link
     #[view]
-    public fun get_transfer_link_info<T>(link_id: String): (address, u64, u64, u64, bool) acquires TransferLinkStore {
+    public fun get_transfer_link_info<T>(claim_id: String): (address, u64, u64, u64, bool) acquires TransferLinkStore {
         if (!exists<TransferLinkStore<T>>(@relynk)) {
             return (@0x0, 0, 0, 0, false)
         };
         
         let store = borrow_global<TransferLinkStore<T>>(@relynk);
-        if (!store.links.contains(link_id)) {
+        if (!store.links.contains(claim_id)) {
             return (@0x0, 0, 0, 0, false)
         };
         
-        let link = store.links.borrow(link_id);
+        let link = store.links.borrow(claim_id);
         (link.sender, link.amount, link.created_at, link.expires_at, link.is_claimed)
+    }
+
+    // current counter (for debugging)
+    #[view]
+    public fun get_current_counter(): u64 acquires LinkCounter {
+        if (!exists<LinkCounter>(@relynk)) return 0;
+        borrow_global<LinkCounter>(@relynk).count
     }
 
     #[view]
