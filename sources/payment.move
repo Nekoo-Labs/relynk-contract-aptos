@@ -7,6 +7,7 @@ module relynk::paymentv1 {
     use aptos_framework::type_info;
     use aptos_framework::timestamp;
     use aptos_framework::account;
+    use aptos_framework::aptos_coin::AptosCoin;
     use aptos_std::table::{Self, Table};
     use std::hash;
     use relynk::supported_tokens;
@@ -35,7 +36,7 @@ module relynk::paymentv1 {
 
     #[event]
     struct TransferLinkCreated has drop, store {
-        claim_id: String,
+        link_hash: String,
         sender: address,
         amount: u64,
         token: String,
@@ -45,7 +46,7 @@ module relynk::paymentv1 {
 
     #[event]
     struct TransferClaimed has drop, store {
-        claim_id: String,
+        link_hash: String,
         sender: address,
         claimer: address,
         amount: u64,
@@ -76,7 +77,7 @@ module relynk::paymentv1 {
         is_claimed: bool,
     }
 
-    fun generate_claim_id(sender: address, counter: u64): String {
+    fun generate_secret_id(sender: address, counter: u64): String {
         let timestamp = timestamp::now_seconds();
         let data = vector::empty<u8>();
 
@@ -94,8 +95,8 @@ module relynk::paymentv1 {
         let counter_bytes = vector::empty<u8>();
         let temp_counter = counter;
         while (temp_counter > 0) {
-            timestamp_bytes.push_back((temp_timestamp % 256) as u8);
-            temp_timestamp /= 256;
+            counter_bytes.push_back((temp_counter % 256) as u8);
+            temp_counter /= 256;
         };
         data.append(counter_bytes);
         
@@ -104,13 +105,30 @@ module relynk::paymentv1 {
         let hex_chars = b"0123456789abcdef";
         let hex_string = vector::empty<u8>();
         let i = 0;
-        while (1 < 16 && i < hash_bytes.length()) {
+        while (i < hash_bytes.length()) {
             let byte = hash_bytes[i];
             hex_string.push_back(hex_chars[(byte >> 4) as u64]);
-            hex_string.push_back(hex_chars[(byte & 0x0F) as u64]);
+            hex_string.push_back(hex_chars[(byte & 0x0f) as u64]);
             i += 1;
         };
 
+        string::utf8(hex_string)
+    }
+
+    // Hash secret for storage key
+    fun hash_secret(secret: &String): String {
+        let secret_bytes = secret.bytes();
+        let hash_bytes = hash::sha3_256(*secret_bytes);
+
+        let hex_chars = b"0123456789abcdef";
+        let hex_string = vector::empty<u8>();
+        let i = 0;
+        while (i < hash_bytes.length()) {
+            let byte = hash_bytes[i];
+            hex_string.push_back(hex_chars[(byte >> 4) as u64]);
+            hex_string.push_back(hex_chars[(byte & 0x0f) as u64]);
+            i += 1;
+        };
         string::utf8(hex_string)
     }
 
@@ -122,13 +140,12 @@ module relynk::paymentv1 {
         coin::register<aptos_framework::aptos_coin::AptosCoin>(&escrow_signer);
         coin::register<MockUSDC>(&escrow_signer);
 
-        // Store escrow capability
         move_to(admin, EscrowCapability { cap });
-
         move_to(admin, LinkCounter { count: 0 });
 
         // auto add mock USDC as supported token
         supported_tokens::add_supported_token<MockUSDC>(admin);
+        supported_tokens::add_supported_token<AptosCoin>(admin);
     }
 
     // Ensure store exists for a token type
@@ -143,8 +160,7 @@ module relynk::paymentv1 {
         }
     }
 
-    // 1. Process payment (untuk payment request yang linknya dibuat off-chain)
-    // Process payment from payer to recipient directly
+    // Process payment from link
     public entry fun process_payment<T: store>(
         payer: &signer, 
         recipient: address, 
@@ -199,10 +215,6 @@ module relynk::paymentv1 {
         if (!coin::is_account_registered<T>(sender_addr)) {
             coin::register<T>(sender);
         };
-
-        if (!coin::is_account_registered<T>(sender_addr)) {
-            coin::register<T>(sender);
-        };
         
         // Get escrow signer
         let cap = borrow_global<EscrowCapability>(@relynk);
@@ -214,6 +226,7 @@ module relynk::paymentv1 {
             coin::register<T>(&escrow_signer);
         };
 
+        // Auto create store if not exists
         if (!exists<TransferLinkStore<T>>(@relynk)) {
             let admin_signer = account::create_signer_with_capability(&cap.cap);
             move_to(&admin_signer, TransferLinkStore<T> { 
@@ -221,9 +234,12 @@ module relynk::paymentv1 {
             });
         };
 
+        // Generate unique claim ID
         let counter = borrow_global_mut<LinkCounter>(@relynk);
         counter.count += 1;
-        let claim_id = generate_claim_id(sender_addr, counter.count);
+        let secret_claim_id = generate_secret_id(sender_addr, counter.count);
+
+        let link_hash = hash_secret(&secret_claim_id);
         
         // Get the store
         let store = borrow_global_mut<TransferLinkStore<T>>(@relynk);
@@ -234,7 +250,7 @@ module relynk::paymentv1 {
         let expires_at = timestamp::now_seconds() + expires_in_hours * 3600;
         
         // Create transfer link
-        store.links.add(claim_id, TransferLink<T> {
+        store.links.add(link_hash, TransferLink<T> {
             sender: sender_addr,
             amount,
             created_at: timestamp::now_seconds(),
@@ -243,7 +259,7 @@ module relynk::paymentv1 {
         });
 
         event::emit(TransferLinkCreated {
-            claim_id,
+            link_hash,
             sender: sender_addr,
             amount,
             token: type_info::type_name<T>(),
@@ -255,7 +271,7 @@ module relynk::paymentv1 {
     // 3. Claim transfer (recipient claims money from link)
     public entry fun claim_transfer<T: store>(
         claimer: &signer, 
-        claim_id: String
+        secret_claim_id: String
     ) acquires EscrowCapability, TransferLinkStore {
         let claimer_addr = signer::address_of(claimer);
         
@@ -263,11 +279,13 @@ module relynk::paymentv1 {
         if (!coin::is_account_registered<T>(claimer_addr)) {
             coin::register<T>(claimer);
         };
+
+        let link_hash = hash_secret(&secret_claim_id);
         
         let store = borrow_global_mut<TransferLinkStore<T>>(@relynk);
-        assert!(store.links.contains(claim_id), E_LINK_NOT_FOUND);
+        assert!(store.links.contains(link_hash), E_LINK_NOT_FOUND);
 
-        let transfer_link = store.links.borrow_mut(claim_id);
+        let transfer_link = store.links.borrow_mut(link_hash);
         assert!(!transfer_link.is_claimed, E_LINK_ALREADY_CLAIMED);
         assert!(timestamp::now_seconds() <= transfer_link.expires_at, E_LINK_EXPIRED);
 
@@ -281,7 +299,7 @@ module relynk::paymentv1 {
         transfer_link.is_claimed = true;
 
         event::emit(TransferClaimed {
-            claim_id,
+            link_hash,
             sender: transfer_link.sender,
             claimer: claimer_addr,
             amount: transfer_link.amount,
@@ -290,19 +308,30 @@ module relynk::paymentv1 {
         });
     }
 
+    public fun simulate_create_transfer<T: store>(sender_addr: address, amount: u64, expires_in_hours: u64): String acquires LinkCounter {
+        let counter = if (exists<LinkCounter>(@relynk)) {
+            borrow_global<LinkCounter>(@relynk).count + 1
+        } else {
+            1
+        };
+
+        generate_secret_id(sender_addr, counter)
+    }
+
     // View function untuk cek info transfer link
     #[view]
-    public fun get_transfer_link_info<T>(claim_id: String): (address, u64, u64, u64, bool) acquires TransferLinkStore {
+    public fun get_transfer_link_info<T>(secret_claim_id: String): (address, u64, u64, u64, bool) acquires TransferLinkStore {
         if (!exists<TransferLinkStore<T>>(@relynk)) {
             return (@0x0, 0, 0, 0, false)
         };
         
+        let link_hash = hash_secret(&secret_claim_id);
         let store = borrow_global<TransferLinkStore<T>>(@relynk);
-        if (!store.links.contains(claim_id)) {
+        if (!store.links.contains(link_hash)) {
             return (@0x0, 0, 0, 0, false)
         };
-        
-        let link = store.links.borrow(claim_id);
+
+        let link = store.links.borrow(link_hash);
         (link.sender, link.amount, link.created_at, link.expires_at, link.is_claimed)
     }
 
@@ -316,5 +345,10 @@ module relynk::paymentv1 {
     #[view]
     public fun is_token_supported<T>(): bool {
         supported_tokens::is_supported<T>(@relynk)
+    }
+
+    #[view]
+    public fun get_hash_from_secret(secret: String): String {
+        hash_secret(&secret)
     }
 }
